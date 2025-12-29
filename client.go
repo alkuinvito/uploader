@@ -12,58 +12,56 @@ import (
 )
 
 type UploadClient struct {
-	ServerURL  string
-	ChunkSize  int
-	HTTPClient *http.Client
+	endpoint   string
+	chunkSize  int
+	httpClient *http.Client
 }
 
-type UploadClientOptions struct {
-	ServerURL  string
-	ChunkSize  int
-	HTTPClient *http.Client
-}
-
-type UploadOptions struct {
-	OnProgress        func(uploaded, total int64)
-	ChecksumAlgorithm string // "md5" or "sha256"
-}
-
-type UploadResult struct {
-	Checksum string
-	Size     int64
+type IUploadClient interface {
+	calculateChecksum(data []byte, algorithm string) (string, error)
+	PutObject(bucketName, objectName string, data []byte, opts *UploadOptions) (*UploadResult, error)
+	sendChunk(chunk []byte, filename string, chunkNum int, checksum string) error
+	verifyChecksum(filename, expectedChecksum string) error
 }
 
 // NewClient creates a new upload client
 func NewClient(options *UploadClientOptions) *UploadClient {
 	return &UploadClient{
-		ServerURL:  options.ServerURL,
-		ChunkSize:  options.ChunkSize,
-		HTTPClient: options.HTTPClient,
+		endpoint:   options.Endpoint,
+		chunkSize:  options.ChunkSize,
+		httpClient: options.HTTPClient,
 	}
 }
 
 // NewClientWithDefaults creates a new upload client with default options
-func NewClientWithDefaults(serverURL string) *UploadClient {
+func NewClientWithDefaults(endpoint string) *UploadClient {
 	return NewClient(&UploadClientOptions{
-		ServerURL:  serverURL,
+		Endpoint:   endpoint,
 		ChunkSize:  1024 * 1024, // 1MB default
 		HTTPClient: &http.Client{},
 	})
 }
 
-// UploadBase64 uploads a base64-encoded file in chunks with checksum verification
-func (c *UploadClient) UploadBase64(base64String string, filename string, opts *UploadOptions) (*UploadResult, error) {
-	// Decode base64 string
-	decoded, err := base64.StdEncoding.DecodeString(base64String)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode base64: %w", err)
+func (c *UploadClient) calculateChecksum(data []byte, algorithm string) (string, error) {
+	switch algorithm {
+	case Sha256Sum, "":
+		hash := sha256.Sum256(data)
+		return hex.EncodeToString(hash[:]), nil
+	case Md5Sum:
+		hash := md5.Sum(data)
+		return hex.EncodeToString(hash[:]), nil
+	default:
+		return "", fmt.Errorf("unsupported algorithm: %s", algorithm)
 	}
+}
 
-	totalSize := int64(len(decoded))
-	reader := bytes.NewReader(decoded)
+// PutObject uploads a base64-encoded file in chunks with checksum verification
+func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opts *UploadOptions) (*UploadResult, error) {
+	totalSize := int64(len(data))
+	reader := bytes.NewReader(data)
 
 	// Calculate checksum
-	checksum, err := c.calculateChecksum(decoded, opts.ChecksumAlgorithm)
+	checksum, err := c.calculateChecksum(data, opts.ChecksumAlgorithm)
 	if err != nil {
 		return nil, fmt.Errorf("failed to calculate checksum: %w", err)
 	}
@@ -73,7 +71,7 @@ func (c *UploadClient) UploadBase64(base64String string, filename string, opts *
 	chunkNum := 0
 
 	for {
-		chunk := make([]byte, c.ChunkSize)
+		chunk := make([]byte, c.chunkSize)
 		n, err := reader.Read(chunk)
 		if err != nil && err != io.EOF {
 			return nil, fmt.Errorf("failed to read chunk: %w", err)
@@ -84,7 +82,7 @@ func (c *UploadClient) UploadBase64(base64String string, filename string, opts *
 		}
 
 		// Send chunk to server
-		if err := c.sendChunk(chunk[:n], filename, chunkNum, checksum); err != nil {
+		if err := c.sendChunk(chunk[:n], bucketName, objectName, chunkNum, checksum); err != nil {
 			return nil, fmt.Errorf("failed to send chunk %d: %w", chunkNum, err)
 		}
 
@@ -102,7 +100,7 @@ func (c *UploadClient) UploadBase64(base64String string, filename string, opts *
 	}
 
 	// Verify with server
-	if err := c.verifyChecksum(filename, checksum); err != nil {
+	if err := c.verifyChecksum(bucketName, objectName, checksum); err != nil {
 		return nil, fmt.Errorf("checksum verification failed: %w", err)
 	}
 
@@ -112,27 +110,14 @@ func (c *UploadClient) UploadBase64(base64String string, filename string, opts *
 	}, nil
 }
 
-func (c *UploadClient) calculateChecksum(data []byte, algorithm string) (string, error) {
-	switch algorithm {
-	case "sha256", "":
-		hash := sha256.Sum256(data)
-		return hex.EncodeToString(hash[:]), nil
-	case "md5":
-		hash := md5.Sum(data)
-		return hex.EncodeToString(hash[:]), nil
-	default:
-		return "", fmt.Errorf("unsupported algorithm: %s", algorithm)
-	}
-}
-
-func (c *UploadClient) sendChunk(chunk []byte, filename string, chunkNum int, checksum string) error {
-	url := fmt.Sprintf("%s/uploads/chunk", c.ServerURL)
+func (c *UploadClient) sendChunk(chunk []byte, bucketName, objectName string, chunkNum int, checksum string) error {
+	url := fmt.Sprintf("%s/uploads/chunk", c.endpoint)
 
 	// Encode chunk back to base64 for transmission
 	encodedChunk := base64.StdEncoding.EncodeToString(chunk)
 
-	payload := fmt.Sprintf(`{"filename":"%s","chunk_num":%d,"data":"%s","checksum":"%s"}`,
-		filename, chunkNum, encodedChunk, checksum)
+	payload := fmt.Sprintf(`{"bucket_name":"%s","object_name":"%s","chunk_num":%d,"data":"%s","checksum":"%s"}`,
+		bucketName, objectName, chunkNum, encodedChunk, checksum)
 
 	req, err := http.NewRequest("POST", url, bytes.NewBufferString(payload))
 	if err != nil {
@@ -141,7 +126,7 @@ func (c *UploadClient) sendChunk(chunk []byte, filename string, chunkNum int, ch
 
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -154,11 +139,11 @@ func (c *UploadClient) sendChunk(chunk []byte, filename string, chunkNum int, ch
 	return nil
 }
 
-func (c *UploadClient) verifyChecksum(filename, expectedChecksum string) error {
-	url := fmt.Sprintf("%s/uploads/verify?filename=%s&checksum=%s",
-		c.ServerURL, filename, expectedChecksum)
+func (c *UploadClient) verifyChecksum(bucketName, objectName, expectedChecksum string) error {
+	url := fmt.Sprintf("%s/uploads/verify?bucket=%s&object_name=%s&checksum=%s",
+		c.endpoint, bucketName, objectName, expectedChecksum)
 
-	resp, err := c.HTTPClient.Get(url)
+	resp, err := c.httpClient.Get(url)
 	if err != nil {
 		return err
 	}
