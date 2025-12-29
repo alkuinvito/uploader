@@ -36,10 +36,11 @@ func NewClient(options *UploadClientOptions) *UploadClient {
 }
 
 // NewClientWithDefaults creates a new upload client with default options
-func NewClientWithDefaults(endpoint string) *UploadClient {
+func NewClientWithDefaults(endpoint, accessKey string) *UploadClient {
 	return NewClient(&UploadClientOptions{
-		Endpoint:   endpoint,
+		AccessKey:  accessKey,
 		ChunkSize:  1024 * 1024, // 1MB default
+		Endpoint:   endpoint,
 		HTTPClient: &http.Client{},
 	})
 }
