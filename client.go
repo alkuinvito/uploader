@@ -6,9 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+
+	"github.com/google/uuid"
 )
 
 type UploadClient struct {
@@ -21,8 +24,25 @@ type UploadClient struct {
 type IUploadClient interface {
 	calculateChecksum(data []byte, algorithm string) (string, error)
 	PutObject(bucketName, objectName string, data []byte, opts *UploadOptions) (*UploadResult, error)
-	sendChunk(chunk []byte, filename string, chunkNum int, checksum string) error
-	verifyChecksum(filename, expectedChecksum string) error
+	sendChunk(bucketName, objectName, fileId string, chunk []byte, chunkNum int, checksum string) error
+	verifyChecksum(bucketName, objectName, fileId, expectedChecksum string) error
+}
+
+// Request structs matching server expectations [web:97][web:98]
+type chunkRequest struct {
+	Bucket   string `json:"bucket" binding:"required"`
+	Path     string `json:"path" binding:"required"`
+	FileId   string `json:"file_id" binding:"required"`
+	ChunkNum int    `json:"chunk_num" binding:"required"`
+	Data     string `json:"data" binding:"required"`
+	Checksum string `json:"checksum" binding:"required"`
+}
+
+type verifyRequest struct {
+	Bucket   string `json:"bucket" binding:"required"`
+	Path     string `json:"path" binding:"required"`
+	FileId   string `json:"file_id" binding:"required"`
+	Checksum string `json:"checksum" binding:"required"`
 }
 
 // NewClient creates a new upload client
@@ -63,11 +83,20 @@ func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opt
 	totalSize := int64(len(data))
 	reader := bytes.NewReader(data)
 
+	// Determine checksum algorithm
+	checksumAlgo := Sha256Sum
+	if opts != nil && opts.ChecksumAlgorithm != "" {
+		checksumAlgo = opts.ChecksumAlgorithm
+	}
+
 	// Calculate checksum
-	checksum, err := c.calculateChecksum(data, opts.ChecksumAlgorithm)
+	checksum, err := c.calculateChecksum(data, checksumAlgo)
 	if err != nil {
 		return nil, fmt.Errorf("failed to calculate checksum: %w", err)
 	}
+
+	// Generate unique file ID for this upload [web:87][web:90]
+	fileId := uuid.New().String()
 
 	// Upload in chunks
 	var uploaded int64
@@ -85,7 +114,7 @@ func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opt
 		}
 
 		// Send chunk to server
-		if err := c.sendChunk(chunk[:n], bucketName, objectName, chunkNum, checksum); err != nil {
+		if err := c.sendChunk(bucketName, objectName, fileId, chunk[:n], chunkNum, checksum); err != nil {
 			return nil, fmt.Errorf("failed to send chunk %d: %w", chunkNum, err)
 		}
 
@@ -103,7 +132,7 @@ func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opt
 	}
 
 	// Verify with server
-	if err := c.verifyChecksum(bucketName, objectName, checksum); err != nil {
+	if err := c.verifyChecksum(bucketName, objectName, fileId, checksum); err != nil {
 		return nil, fmt.Errorf("checksum verification failed: %w", err)
 	}
 
@@ -113,16 +142,29 @@ func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opt
 	}, nil
 }
 
-func (c *UploadClient) sendChunk(chunk []byte, bucketName, objectName string, chunkNum int, checksum string) error {
-	url := fmt.Sprintf("%s/uploads/chunk", c.endpoint)
+func (c *UploadClient) sendChunk(bucketName, objectName, fileId string, chunk []byte, chunkNum int, checksum string) error {
+	url := fmt.Sprintf("%s/upload/chunk", c.endpoint)
 
-	// Encode chunk back to base64 for transmission
+	// Encode chunk to base64 for transmission
 	encodedChunk := base64.StdEncoding.EncodeToString(chunk)
 
-	payload := fmt.Sprintf(`{"bucket_name":"%s","object_name":"%s","chunk_num":%d,"data":"%s","checksum":"%s"}`,
-		bucketName, objectName, chunkNum, encodedChunk, checksum)
+	// Create request payload matching server structure [web:93][web:95]
+	payload := chunkRequest{
+		Bucket:   bucketName,
+		Path:     objectName,
+		FileId:   fileId,
+		ChunkNum: chunkNum,
+		Data:     encodedChunk,
+		Checksum: checksum,
+	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewBufferString(payload))
+	// Marshal to JSON [web:93][web:98]
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal chunk request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return err
 	}
@@ -137,22 +179,38 @@ func (c *UploadClient) sendChunk(chunk []byte, bucketName, objectName string, ch
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("server returned status %d", resp.StatusCode)
+		// Read response body for debugging [web:96]
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server returned status %d: %s", resp.StatusCode, string(body))
 	}
 
 	return nil
 }
 
-func (c *UploadClient) verifyChecksum(bucketName, objectName, expectedChecksum string) error {
-	url := fmt.Sprintf("%s/uploads/verify?bucket=%s&object_name=%s&checksum=%s",
-		c.endpoint, bucketName, objectName, expectedChecksum)
+func (c *UploadClient) verifyChecksum(bucketName, objectName, fileId, expectedChecksum string) error {
+	url := fmt.Sprintf("%s/upload/verify", c.endpoint)
 
-	req, err := http.NewRequest("GET", url, nil)
+	// Create verify request payload [web:93][web:97]
+	payload := verifyRequest{
+		Bucket:   bucketName,
+		Path:     objectName,
+		FileId:   fileId,
+		Checksum: expectedChecksum,
+	}
+
+	// Marshal to JSON [web:98]
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal verify request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return err
 	}
 
 	req.Header.Set("X-API-KEY", c.accessKey)
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -160,8 +218,10 @@ func (c *UploadClient) verifyChecksum(bucketName, objectName, expectedChecksum s
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("verification failed with status %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		// Read response body for debugging [web:96][web:99]
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("verification failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
 	return nil
