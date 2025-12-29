@@ -28,21 +28,21 @@ type IUploadClient interface {
 	verifyChecksum(bucketName, objectName, fileId, expectedChecksum string) error
 }
 
-// Request structs matching server expectations [web:97][web:98]
+// Request structs matching server's exact JSON tags
 type chunkRequest struct {
-	Bucket   string `json:"bucket" binding:"required"`
-	Path     string `json:"path" binding:"required"`
-	FileId   string `json:"file_id" binding:"required"`
-	ChunkNum int    `json:"chunk_num" binding:"required"`
-	Data     string `json:"data" binding:"required"`
-	Checksum string `json:"checksum" binding:"required"`
+	BucketName string `json:"bucket_name"`
+	ObjectName string `json:"object_name"`
+	FileId     string `json:"file_id"`
+	ChunkNum   int    `json:"chunk_num"`
+	Data       string `json:"data"`
+	Checksum   string `json:"checksum"`
 }
 
 type verifyRequest struct {
-	Bucket   string `json:"bucket" binding:"required"`
-	Path     string `json:"path" binding:"required"`
-	FileId   string `json:"file_id" binding:"required"`
-	Checksum string `json:"checksum" binding:"required"`
+	Bucket   string `json:"bucket"`
+	Path     string `json:"path"`
+	FileId   string `json:"file_id"`
+	Checksum string `json:"checksum"`
 }
 
 // NewClient creates a new upload client
@@ -95,7 +95,7 @@ func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opt
 		return nil, fmt.Errorf("failed to calculate checksum: %w", err)
 	}
 
-	// Generate unique file ID for this upload [web:87][web:90]
+	// Generate unique file ID for this upload
 	fileId := uuid.New().String()
 
 	// Upload in chunks
@@ -143,22 +143,22 @@ func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opt
 }
 
 func (c *UploadClient) sendChunk(bucketName, objectName, fileId string, chunk []byte, chunkNum int, checksum string) error {
-	url := fmt.Sprintf("%s/upload/chunk", c.endpoint)
+	url := fmt.Sprintf("%s/api/upload/chunk", c.endpoint)
 
 	// Encode chunk to base64 for transmission
 	encodedChunk := base64.StdEncoding.EncodeToString(chunk)
 
-	// Create request payload matching server structure [web:93][web:95]
+	// Create request with bucket_name and object_name tags
 	payload := chunkRequest{
-		Bucket:   bucketName,
-		Path:     objectName,
-		FileId:   fileId,
-		ChunkNum: chunkNum,
-		Data:     encodedChunk,
-		Checksum: checksum,
+		BucketName: bucketName,
+		ObjectName: objectName,
+		FileId:     fileId,
+		ChunkNum:   chunkNum,
+		Data:       encodedChunk,
+		Checksum:   checksum,
 	}
 
-	// Marshal to JSON [web:93][web:98]
+	// Marshal to JSON
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal chunk request: %w", err)
@@ -179,7 +179,6 @@ func (c *UploadClient) sendChunk(bucketName, objectName, fileId string, chunk []
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		// Read response body for debugging [web:96]
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("server returned status %d: %s", resp.StatusCode, string(body))
 	}
@@ -188,9 +187,9 @@ func (c *UploadClient) sendChunk(bucketName, objectName, fileId string, chunk []
 }
 
 func (c *UploadClient) verifyChecksum(bucketName, objectName, fileId, expectedChecksum string) error {
-	url := fmt.Sprintf("%s/upload/verify", c.endpoint)
+	url := fmt.Sprintf("%s/api/upload/verify", c.endpoint)
 
-	// Create verify request payload [web:93][web:97]
+	// Create verify request with bucket and path tags
 	payload := verifyRequest{
 		Bucket:   bucketName,
 		Path:     objectName,
@@ -198,7 +197,6 @@ func (c *UploadClient) verifyChecksum(bucketName, objectName, fileId, expectedCh
 		Checksum: expectedChecksum,
 	}
 
-	// Marshal to JSON [web:98]
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal verify request: %w", err)
@@ -219,7 +217,6 @@ func (c *UploadClient) verifyChecksum(bucketName, objectName, fileId, expectedCh
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		// Read response body for debugging [web:96][web:99]
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("verification failed with status %d: %s", resp.StatusCode, string(body))
 	}
