@@ -143,7 +143,7 @@ func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opt
 }
 
 func (c *UploadClient) sendChunk(bucketName, objectName, fileId string, chunk []byte, chunkNum int, checksum string) error {
-	url := fmt.Sprintf("%s/api/upload/chunk", c.endpoint)
+	url := fmt.Sprintf("%s/upload/chunk", c.endpoint)
 
 	// Encode chunk to base64 for transmission
 	encodedChunk := base64.StdEncoding.EncodeToString(chunk)
@@ -187,7 +187,7 @@ func (c *UploadClient) sendChunk(bucketName, objectName, fileId string, chunk []
 }
 
 func (c *UploadClient) verifyChecksum(bucketName, objectName, fileId, expectedChecksum string) error {
-	url := fmt.Sprintf("%s/api/upload/verify", c.endpoint)
+	url := fmt.Sprintf("%s/upload/verify", c.endpoint)
 
 	// Create verify request with bucket and path tags
 	payload := verifyRequest{
