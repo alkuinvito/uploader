@@ -12,8 +12,9 @@ import (
 )
 
 type UploadClient struct {
-	endpoint   string
+	accessKey  string
 	chunkSize  int
+	endpoint   string
 	httpClient *http.Client
 }
 
@@ -27,8 +28,9 @@ type IUploadClient interface {
 // NewClient creates a new upload client
 func NewClient(options *UploadClientOptions) *UploadClient {
 	return &UploadClient{
-		endpoint:   options.Endpoint,
+		accessKey:  options.AccessKey,
 		chunkSize:  options.ChunkSize,
+		endpoint:   options.Endpoint,
 		httpClient: options.HTTPClient,
 	}
 }
@@ -124,6 +126,7 @@ func (c *UploadClient) sendChunk(chunk []byte, bucketName, objectName string, ch
 		return err
 	}
 
+	req.Header.Set("X-API-KEY", c.accessKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
@@ -143,7 +146,14 @@ func (c *UploadClient) verifyChecksum(bucketName, objectName, expectedChecksum s
 	url := fmt.Sprintf("%s/uploads/verify?bucket=%s&object_name=%s&checksum=%s",
 		c.endpoint, bucketName, objectName, expectedChecksum)
 
-	resp, err := c.httpClient.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("X-API-KEY", c.accessKey)
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
 	}

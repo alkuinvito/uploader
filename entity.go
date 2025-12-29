@@ -3,8 +3,9 @@ package uploader
 import "net/http"
 
 type UploadClientOptions struct {
-	Endpoint   string
+	AccessKey  string
 	ChunkSize  int
+	Endpoint   string
 	HTTPClient *http.Client
 }
 
