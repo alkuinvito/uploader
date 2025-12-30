@@ -54,3 +54,19 @@ type DownloadFileRequest struct {
 	Bucket string `json:"bucket"`
 	Path   string `json:"path"`
 }
+
+type ListObjectsRequest struct {
+	Bucket string `json:"bucket" binding:"required"`
+	Path   string `json:"path"`
+}
+
+type StatObjectRequest struct {
+	Bucket string `json:"bucket" binding:"required"`
+	Path   string `json:"path" binding:"required"`
+}
+
+type ObjectInfo struct {
+	Name     string `json:"name"`
+	Size     int64  `json:"size"`
+	Modified string `json:"modified"`
+}

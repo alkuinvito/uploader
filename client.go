@@ -22,13 +22,33 @@ type UploadClient struct {
 }
 
 type IUploadClient interface {
-	calculateChecksum(data []byte, algorithm string) (string, error)
 	DeleteObject(bucketName, objectName string) error
 	DownloadObject(bucketName, objectName string, w io.Writer) error
 	GetObject(bucketName, objectName string) ([]byte, error)
+	ListObjects(bucketName, path string) ([]ObjectInfo, error)
+	StatObject(bucketName, objectName string) (*ObjectInfo, error)
 	PutObject(bucketName, objectName string, data []byte, opts *UploadOptions) (*UploadResult, error)
 	SendChunk(bucketName, objectName, fileId string, chunk []byte, chunkNum int, checksum string) error
-	verifyChecksum(bucketName, objectName, fileId, expectedChecksum string) error
+}
+
+// NewClient creates a new upload client
+func NewClient(options *UploadClientOptions) *UploadClient {
+	return &UploadClient{
+		accessKey:  options.AccessKey,
+		chunkSize:  options.ChunkSize,
+		endpoint:   options.Endpoint,
+		httpClient: options.HTTPClient,
+	}
+}
+
+// NewClientWithDefaults creates a new upload client with default options
+func NewClientWithDefaults(endpoint, accessKey string) *UploadClient {
+	return NewClient(&UploadClientOptions{
+		AccessKey:  accessKey,
+		ChunkSize:  1024 * 1024, // 1MB default
+		Endpoint:   endpoint,
+		HTTPClient: &http.Client{},
+	})
 }
 
 // CalculateChecksum calculates file checksum using selected algorithm
@@ -59,7 +79,7 @@ func (c *UploadClient) DeleteObject(bucketName, objectName string) error {
 		return fmt.Errorf("failed to marshal delete request: %w", err)
 	}
 
-	req, err := http.NewRequest("DELETE", url, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return err
 	}
@@ -162,24 +182,46 @@ func (c *UploadClient) GetObject(bucketName, objectName string) ([]byte, error) 
 	return data, nil
 }
 
-// NewClient creates a new upload client
-func NewClient(options *UploadClientOptions) *UploadClient {
-	return &UploadClient{
-		accessKey:  options.AccessKey,
-		chunkSize:  options.ChunkSize,
-		endpoint:   options.Endpoint,
-		httpClient: options.HTTPClient,
-	}
-}
+// ListObjects lists objects in a bucket
+func (c *UploadClient) ListObjects(bucketName, path string) ([]ObjectInfo, error) {
+	url := fmt.Sprintf("%s/upload/list", c.endpoint)
 
-// NewClientWithDefaults creates a new upload client with default options
-func NewClientWithDefaults(endpoint, accessKey string) *UploadClient {
-	return NewClient(&UploadClientOptions{
-		AccessKey:  accessKey,
-		ChunkSize:  1024 * 1024, // 1MB default
-		Endpoint:   endpoint,
-		HTTPClient: &http.Client{},
-	})
+	reqBody := ListObjectsRequest{
+		Bucket: bucketName,
+		Path:   path,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal get object request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("X-API-KEY", c.accessKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("list objects failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var objects []ObjectInfo
+	err = json.NewDecoder(resp.Body).Decode(&objects)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode list objects response: %w", err)
+	}
+
+	return objects, nil
 }
 
 // PutObject uploads a file in chunks with checksum verification
@@ -279,6 +321,47 @@ func (c *UploadClient) SendChunk(bucketName, objectName, fileId string, chunk []
 	}
 
 	return nil
+}
+
+// StatObject returns information about an object in a bucket
+func (c *UploadClient) StatObject(bucketName, objectName string) (*ObjectInfo, error) {
+	url := fmt.Sprintf("%s/upload/stat", c.endpoint)
+
+	payload := StatObjectRequest{
+		Bucket: bucketName,
+		Path:   objectName,
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal stat request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("X-API-KEY", c.accessKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("server returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var info ObjectInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return nil, fmt.Errorf("failed to decode stat response: %w", err)
+	}
+
+	return &info, nil
 }
 
 // VerifyChecksum calls server verify endpoint

@@ -100,6 +100,58 @@ func main() {
 }
 ```
 
+## Stat object
+
+```go
+import (
+    "fmt"
+    "log"
+
+    "github.com/alkuinvito/uploader"
+)
+
+func main() {
+    client := uploader.NewClientWithDefaults(
+        "https://uploads.yourcompany.com/api/v1",
+        "YOUR_API_KEY",
+    )
+
+    object, err := client.StatObject("your_bucket", "path/to/file.txt")
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Println("name:", object.Name, "size:", object.Size)
+}
+```
+
+## List objects
+
+```go
+import (
+    "fmt"
+    "log"
+
+    "github.com/alkuinvito/uploader"
+)
+
+func main() {
+    client := uploader.NewClientWithDefaults(
+        "https://uploads.yourcompany.com/api/v1",
+        "YOUR_API_KEY",
+    )
+
+    objects, err := client.ListObjects("your_bucket", "path/to/", 100)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    for _, object := range objects {
+        fmt.Println("name:", object.Name, "size:", object.Size)
+    }
+}
+```
+
 ## Delete object
 
 ```go
