@@ -23,26 +23,143 @@ type UploadClient struct {
 
 type IUploadClient interface {
 	calculateChecksum(data []byte, algorithm string) (string, error)
+	DeleteObject(bucketName, objectName string) error
+	DownloadObject(bucketName, objectName string, w io.Writer) error
+	GetObject(bucketName, objectName string) ([]byte, error)
 	PutObject(bucketName, objectName string, data []byte, opts *UploadOptions) (*UploadResult, error)
-	sendChunk(bucketName, objectName, fileId string, chunk []byte, chunkNum int, checksum string) error
+	SendChunk(bucketName, objectName, fileId string, chunk []byte, chunkNum int, checksum string) error
 	verifyChecksum(bucketName, objectName, fileId, expectedChecksum string) error
 }
 
-// Request structs matching server's exact JSON tags
-type chunkRequest struct {
-	BucketName string `json:"bucket_name"`
-	ObjectName string `json:"object_name"`
-	FileId     string `json:"file_id"`
-	ChunkNum   int    `json:"chunk_num"`
-	Data       string `json:"data"`
-	Checksum   string `json:"checksum"`
+// CalculateChecksum calculates file checksum using selected algorithm
+func (c *UploadClient) calculateChecksum(data []byte, algorithm string) (string, error) {
+	switch algorithm {
+	case Sha256Sum, "":
+		hash := sha256.Sum256(data)
+		return hex.EncodeToString(hash[:]), nil
+	case Md5Sum:
+		hash := md5.Sum(data)
+		return hex.EncodeToString(hash[:]), nil
+	default:
+		return "", fmt.Errorf("unsupported algorithm: %s", algorithm)
+	}
 }
 
-type verifyRequest struct {
-	Bucket   string `json:"bucket"`
-	Path     string `json:"path"`
-	FileId   string `json:"file_id"`
-	Checksum string `json:"checksum"`
+// DeleteObject calls DeleteFile handler on server
+func (c *UploadClient) DeleteObject(bucketName, objectName string) error {
+	url := fmt.Sprintf("%s/upload/file", c.endpoint)
+
+	reqBody := DeleteFileRequest{
+		Bucket: bucketName,
+		Path:   objectName,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal delete request: %w", err)
+	}
+
+	req, err := http.NewRequest("DELETE", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("X-API-KEY", c.accessKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("delete failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+// DownloadObject streams object to provided writer (e.g. file)
+func (c *UploadClient) DownloadObject(bucketName, objectName string, w io.Writer) error {
+	url := fmt.Sprintf("%s/upload/download", c.endpoint)
+
+	reqBody := DownloadFileRequest{
+		Bucket: bucketName,
+		Path:   objectName,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal download request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("X-API-KEY", c.accessKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("download failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		return fmt.Errorf("failed to stream object: %w", err)
+	}
+
+	return nil
+}
+
+// GetObject calls server download handler and returns bytes
+func (c *UploadClient) GetObject(bucketName, objectName string) ([]byte, error) {
+	url := fmt.Sprintf("%s/upload/download", c.endpoint)
+
+	reqBody := DownloadFileRequest{
+		Bucket: bucketName,
+		Path:   objectName,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal get object request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("X-API-KEY", c.accessKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("get object failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read object body: %w", err)
+	}
+
+	return data, nil
 }
 
 // NewClient creates a new upload client
@@ -65,40 +182,23 @@ func NewClientWithDefaults(endpoint, accessKey string) *UploadClient {
 	})
 }
 
-func (c *UploadClient) calculateChecksum(data []byte, algorithm string) (string, error) {
-	switch algorithm {
-	case Sha256Sum, "":
-		hash := sha256.Sum256(data)
-		return hex.EncodeToString(hash[:]), nil
-	case Md5Sum:
-		hash := md5.Sum(data)
-		return hex.EncodeToString(hash[:]), nil
-	default:
-		return "", fmt.Errorf("unsupported algorithm: %s", algorithm)
-	}
-}
-
-// PutObject uploads a base64-encoded file in chunks with checksum verification
+// PutObject uploads a file in chunks with checksum verification
 func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opts *UploadOptions) (*UploadResult, error) {
 	totalSize := int64(len(data))
 	reader := bytes.NewReader(data)
 
-	// Determine checksum algorithm
 	checksumAlgo := Sha256Sum
 	if opts != nil && opts.ChecksumAlgorithm != "" {
 		checksumAlgo = opts.ChecksumAlgorithm
 	}
 
-	// Calculate checksum
 	checksum, err := c.calculateChecksum(data, checksumAlgo)
 	if err != nil {
 		return nil, fmt.Errorf("failed to calculate checksum: %w", err)
 	}
 
-	// Generate unique file ID for this upload
 	fileId := uuid.New().String()
 
-	// Upload in chunks
 	var uploaded int64
 	chunkNum := 0
 
@@ -113,15 +213,13 @@ func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opt
 			break
 		}
 
-		// Send chunk to server
-		if err := c.sendChunk(bucketName, objectName, fileId, chunk[:n], chunkNum, checksum); err != nil {
+		if err := c.SendChunk(bucketName, objectName, fileId, chunk[:n], chunkNum, checksum); err != nil {
 			return nil, fmt.Errorf("failed to send chunk %d: %w", chunkNum, err)
 		}
 
 		uploaded += int64(n)
 		chunkNum++
 
-		// Progress callback
 		if opts != nil && opts.OnProgress != nil {
 			opts.OnProgress(uploaded, totalSize)
 		}
@@ -131,7 +229,6 @@ func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opt
 		}
 	}
 
-	// Verify with server
 	if err := c.verifyChecksum(bucketName, objectName, fileId, checksum); err != nil {
 		return nil, fmt.Errorf("checksum verification failed: %w", err)
 	}
@@ -142,14 +239,13 @@ func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opt
 	}, nil
 }
 
-func (c *UploadClient) sendChunk(bucketName, objectName, fileId string, chunk []byte, chunkNum int, checksum string) error {
+// SendChunk sends single chunk to server
+func (c *UploadClient) SendChunk(bucketName, objectName, fileId string, chunk []byte, chunkNum int, checksum string) error {
 	url := fmt.Sprintf("%s/upload/chunk", c.endpoint)
 
-	// Encode chunk to base64 for transmission
 	encodedChunk := base64.StdEncoding.EncodeToString(chunk)
 
-	// Create request with bucket_name and object_name tags
-	payload := chunkRequest{
+	payload := ChunkRequest{
 		BucketName: bucketName,
 		ObjectName: objectName,
 		FileId:     fileId,
@@ -158,7 +254,6 @@ func (c *UploadClient) sendChunk(bucketName, objectName, fileId string, chunk []
 		Checksum:   checksum,
 	}
 
-	// Marshal to JSON
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal chunk request: %w", err)
@@ -186,11 +281,11 @@ func (c *UploadClient) sendChunk(bucketName, objectName, fileId string, chunk []
 	return nil
 }
 
+// VerifyChecksum calls server verify endpoint
 func (c *UploadClient) verifyChecksum(bucketName, objectName, fileId, expectedChecksum string) error {
 	url := fmt.Sprintf("%s/upload/verify", c.endpoint)
 
-	// Create verify request with bucket and path tags
-	payload := verifyRequest{
+	payload := VerifyRequest{
 		Bucket:   bucketName,
 		Path:     objectName,
 		FileId:   fileId,

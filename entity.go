@@ -2,6 +2,11 @@ package uploader
 
 import "net/http"
 
+const (
+	Md5Sum    = "md5"
+	Sha256Sum = "sha256"
+)
+
 type UploadClientOptions struct {
 	AccessKey  string
 	ChunkSize  int
@@ -19,7 +24,33 @@ type UploadResult struct {
 	Size     int64
 }
 
-const (
-	Md5Sum    = "md5"
-	Sha256Sum = "sha256"
-)
+type ChunkRequest struct {
+	BucketName string `json:"bucket_name"`
+	ObjectName string `json:"object_name"`
+	FileId     string `json:"file_id"`
+	ChunkNum   int    `json:"chunk_num"`
+	Data       string `json:"data"`
+	Checksum   string `json:"checksum"`
+}
+
+type VerifyRequest struct {
+	Bucket   string `json:"bucket"`
+	Path     string `json:"path"`
+	FileId   string `json:"file_id"`
+	Checksum string `json:"checksum"`
+}
+
+type GetObjectRequest struct {
+	Bucket string `json:"bucket"`
+	Path   string `json:"path"`
+}
+
+type DeleteFileRequest struct {
+	Bucket string `json:"bucket"`
+	Path   string `json:"path"`
+}
+
+type DownloadFileRequest struct {
+	Bucket string `json:"bucket"`
+	Path   string `json:"path"`
+}
