@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -19,6 +21,7 @@ type UploadClient struct {
 	chunkSize  int
 	endpoint   string
 	httpClient *http.Client
+	logger     *log.Logger
 }
 
 type IUploadClient interface {
@@ -26,28 +29,41 @@ type IUploadClient interface {
 	DownloadObject(bucketName, objectName string, w io.Writer) error
 	GetObject(bucketName, objectName string) ([]byte, error)
 	ListObjects(bucketName, path string) ([]ObjectInfo, error)
-	StatObject(bucketName, objectName string) (*ObjectInfo, error)
 	PutObject(bucketName, objectName string, data []byte, opts *UploadOptions) (*UploadResult, error)
-	SendChunk(bucketName, objectName, fileId string, chunk []byte, chunkNum int, checksum string) error
+	StatObject(bucketName, objectName string) (*ObjectInfo, error)
 }
 
 // NewClient creates a new upload client
 func NewClient(options *UploadClientOptions) *UploadClient {
+	if options.HTTPClient == nil {
+		options.HTTPClient = &http.Client{
+			Timeout: 30 * time.Second, // 30 seconds timeout
+		}
+	}
+
+	if options.Logger == nil {
+		options.Logger = log.New(log.Writer(), "[UPLOADER] ", log.Flags())
+	}
+
 	return &UploadClient{
 		accessKey:  options.AccessKey,
 		chunkSize:  options.ChunkSize,
 		endpoint:   options.Endpoint,
 		httpClient: options.HTTPClient,
+		logger:     options.Logger,
 	}
 }
 
 // NewClientWithDefaults creates a new upload client with default options
 func NewClientWithDefaults(endpoint, accessKey string) *UploadClient {
 	return NewClient(&UploadClientOptions{
-		AccessKey:  accessKey,
-		ChunkSize:  1024 * 1024, // 1MB default
-		Endpoint:   endpoint,
-		HTTPClient: &http.Client{},
+		AccessKey: accessKey,
+		ChunkSize: 1024 * 1024, // 1MB default
+		Endpoint:  endpoint,
+		HTTPClient: &http.Client{
+			Timeout: 30 * time.Second, // 30 seconds timeout
+		},
+		Logger: log.New(log.Writer(), "[UPLOADER] ", log.Flags()),
 	})
 }
 
@@ -61,27 +77,30 @@ func (c *UploadClient) calculateChecksum(data []byte, algorithm string) (string,
 		hash := md5.Sum(data)
 		return hex.EncodeToString(hash[:]), nil
 	default:
-		return "", fmt.Errorf("unsupported algorithm: %s", algorithm)
+		c.logger.Printf("Unsupported algorithm: %s", algorithm)
+		return "", ErrUnsupportedAlgorithm
 	}
 }
 
 // DeleteObject calls DeleteFile handler on server
 func (c *UploadClient) DeleteObject(bucketName, objectName string) error {
-	url := fmt.Sprintf("%s/upload/file", c.endpoint)
+	url := fmt.Sprintf("%s/upload/delete", c.endpoint)
 
-	reqBody := DeleteFileRequest{
+	reqBody := deleteFileRequest{
 		Bucket: bucketName,
 		Path:   objectName,
 	}
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
-		return fmt.Errorf("failed to marshal delete request: %w", err)
+		c.logger.Printf("Failed to marshal request body: %v", err)
+		return ErrFailedToParseRequest
 	}
 
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return err
+		c.logger.Printf("Failed to create request: %v", err)
+		return ErrFailedToParseRequest
 	}
 
 	req.Header.Set("X-API-KEY", c.accessKey)
@@ -89,35 +108,31 @@ func (c *UploadClient) DeleteObject(bucketName, objectName string) error {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		c.logger.Printf("Failed to send request: %v", err)
+		return ErrFailedToConnect
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("delete failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	return nil
+	return c.parseServerResponse(resp, nil)
 }
 
 // DownloadObject streams object to provided writer (e.g. file)
 func (c *UploadClient) DownloadObject(bucketName, objectName string, w io.Writer) error {
 	url := fmt.Sprintf("%s/upload/download", c.endpoint)
 
-	reqBody := DownloadFileRequest{
+	reqBody := downloadFileRequest{
 		Bucket: bucketName,
 		Path:   objectName,
 	}
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
-		return fmt.Errorf("failed to marshal download request: %w", err)
+		return ErrFailedToParseRequest
 	}
 
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return err
+		return ErrFailedToParseRequest
 	}
 
 	req.Header.Set("X-API-KEY", c.accessKey)
@@ -125,17 +140,18 @@ func (c *UploadClient) DownloadObject(bucketName, objectName string, w io.Writer
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return ErrFailedToConnect
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("download failed with status %d: %s", resp.StatusCode, string(body))
+	err = c.parseServerResponse(resp, nil)
+	if err != nil {
+		return err
 	}
 
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		return fmt.Errorf("failed to stream object: %w", err)
+		c.logger.Printf("Failed to stream object: %v", err)
+		return ErrClientFailedToReadObject
 	}
 
 	return nil
@@ -145,19 +161,21 @@ func (c *UploadClient) DownloadObject(bucketName, objectName string, w io.Writer
 func (c *UploadClient) GetObject(bucketName, objectName string) ([]byte, error) {
 	url := fmt.Sprintf("%s/upload/download", c.endpoint)
 
-	reqBody := DownloadFileRequest{
+	reqBody := downloadFileRequest{
 		Bucket: bucketName,
 		Path:   objectName,
 	}
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal get object request: %w", err)
+		c.logger.Printf("Failed to create request: %v", err)
+		return nil, ErrFailedToParseRequest
 	}
 
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return nil, err
+		c.logger.Printf("Failed to create request: %v", err)
+		return nil, ErrFailedToParseRequest
 	}
 
 	req.Header.Set("X-API-KEY", c.accessKey)
@@ -165,18 +183,24 @@ func (c *UploadClient) GetObject(bucketName, objectName string) ([]byte, error) 
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		c.logger.Printf("Failed to send request: %v", err)
+		return nil, ErrFailedToConnect
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("get object failed with status %d: %s", resp.StatusCode, string(body))
+		err = c.parseServerResponse(resp, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		return nil, ErrUnknown
 	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read object body: %w", err)
+		c.logger.Printf("Failed to read object body: %v", err)
+		return nil, ErrClientFailedToReadObject
 	}
 
 	return data, nil
@@ -184,21 +208,25 @@ func (c *UploadClient) GetObject(bucketName, objectName string) ([]byte, error) 
 
 // ListObjects lists objects in a bucket
 func (c *UploadClient) ListObjects(bucketName, path string) ([]ObjectInfo, error) {
+	var result []ObjectInfo
+
 	url := fmt.Sprintf("%s/upload/list", c.endpoint)
 
-	reqBody := ListObjectsRequest{
+	reqBody := listObjectsRequest{
 		Bucket: bucketName,
 		Path:   path,
 	}
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal get object request: %w", err)
+		c.logger.Printf("Failed to marshal list objects request: %v", err)
+		return nil, ErrFailedToParseRequest
 	}
 
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return nil, err
+		c.logger.Printf("Failed to marshal list objects request: %v", err)
+		return nil, ErrFailedToParseRequest
 	}
 
 	req.Header.Set("X-API-KEY", c.accessKey)
@@ -206,22 +234,72 @@ func (c *UploadClient) ListObjects(bucketName, path string) ([]ObjectInfo, error
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		c.logger.Printf("Failed to send list objects request: %v", err)
+		return nil, ErrFailedToConnect
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("list objects failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var objects []ObjectInfo
-	err = json.NewDecoder(resp.Body).Decode(&objects)
+	err = c.parseServerResponse(resp, &result)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode list objects response: %w", err)
+		return nil, err
 	}
 
-	return objects, nil
+	return result, nil
+}
+
+// parseServerError parses the error response from the server
+func (c *UploadClient) parseServerError(err *serverErrorBody) error {
+	if err == nil {
+		return nil
+	}
+
+	switch err.ErrorCode {
+	case "ErrNotFound":
+		return ErrResourceNotFound
+	case "ErrAuthApiKey":
+		return ErrUnauthorized
+	case "ErrBucketNotFound":
+		return ErrBucketNotFound
+	case "ErrObjectNotFound":
+		return ErrObjectNotFound
+	case "ErrObjectFailedToCreateDir":
+		return ErrObjectFailedToCreateDir
+	case "ErrObjectFailedToCreateObj":
+		return ErrObjectFailedToCreateObject
+	case "ErrObjectFailedToOpen":
+		return ErrObjectFailedToOpen
+	case "ErrObjectInvalidDataURI":
+		return ErrObjectInvalidDataURI
+	}
+
+	return ErrUnknown
+}
+
+// parseServerResponse parses the response from the server
+func (c *UploadClient) parseServerResponse(resp *http.Response, out any) error {
+	var response serverResponse
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.logger.Printf("Failed to read response body: %v", err)
+		return ErrParseResponseFailed
+	}
+
+	err = json.Unmarshal(body, &response)
+	if err != nil {
+		c.logger.Printf("Failed to unmarshal response body: %v", err)
+		return ErrParseResponseFailed
+	}
+
+	if out != nil {
+		err = json.Unmarshal(response.Data, out)
+		if err != nil {
+			c.logger.Printf("Failed to unmarshal response body: %v", err)
+			return ErrParseResponseFailed
+		}
+	}
+
+	return c.parseServerError(response.Error)
 }
 
 // PutObject uploads a file in chunks with checksum verification
@@ -236,7 +314,8 @@ func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opt
 
 	checksum, err := c.calculateChecksum(data, checksumAlgo)
 	if err != nil {
-		return nil, fmt.Errorf("failed to calculate checksum: %w", err)
+		c.logger.Printf("Failed to calculate checksum: %v", err)
+		return nil, err
 	}
 
 	fileId := uuid.New().String()
@@ -248,15 +327,17 @@ func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opt
 		chunk := make([]byte, c.chunkSize)
 		n, err := reader.Read(chunk)
 		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("failed to read chunk: %w", err)
+			c.logger.Printf("Failed to read chunk: %v", err)
+			return nil, ErrClientUploadFailed
 		}
 
 		if n == 0 {
 			break
 		}
 
-		if err := c.SendChunk(bucketName, objectName, fileId, chunk[:n], chunkNum, checksum); err != nil {
-			return nil, fmt.Errorf("failed to send chunk %d: %w", chunkNum, err)
+		if err := c.sendChunk(bucketName, objectName, fileId, chunk[:n], chunkNum, checksum); err != nil {
+			c.logger.Printf("Failed to send chunk: %v", err)
+			return nil, err
 		}
 
 		uploaded += int64(n)
@@ -272,7 +353,7 @@ func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opt
 	}
 
 	if err := c.verifyChecksum(bucketName, objectName, fileId, checksum); err != nil {
-		return nil, fmt.Errorf("checksum verification failed: %w", err)
+		return nil, ErrChecksumMismatch
 	}
 
 	return &UploadResult{
@@ -282,12 +363,12 @@ func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opt
 }
 
 // SendChunk sends single chunk to server
-func (c *UploadClient) SendChunk(bucketName, objectName, fileId string, chunk []byte, chunkNum int, checksum string) error {
+func (c *UploadClient) sendChunk(bucketName, objectName, fileId string, chunk []byte, chunkNum int, checksum string) error {
 	url := fmt.Sprintf("%s/upload/chunk", c.endpoint)
 
 	encodedChunk := base64.StdEncoding.EncodeToString(chunk)
 
-	payload := ChunkRequest{
+	payload := chunkRequest{
 		BucketName: bucketName,
 		ObjectName: objectName,
 		FileId:     fileId,
@@ -298,12 +379,14 @@ func (c *UploadClient) SendChunk(bucketName, objectName, fileId string, chunk []
 
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("failed to marshal chunk request: %w", err)
+		c.logger.Printf("Failed to marshal chunk request: %v", err)
+		return ErrFailedToParseRequest
 	}
 
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return err
+		c.logger.Printf("Failed to create request: %v", err)
+		return ErrFailedToParseRequest
 	}
 
 	req.Header.Set("X-API-KEY", c.accessKey)
@@ -311,35 +394,35 @@ func (c *UploadClient) SendChunk(bucketName, objectName, fileId string, chunk []
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		c.logger.Printf("Failed to connect to server: %v", err)
+		return ErrFailedToConnect
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("server returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	return nil
+	return c.parseServerResponse(resp, nil)
 }
 
 // StatObject returns information about an object in a bucket
 func (c *UploadClient) StatObject(bucketName, objectName string) (*ObjectInfo, error) {
+	var result ObjectInfo
+
 	url := fmt.Sprintf("%s/upload/stat", c.endpoint)
 
-	payload := StatObjectRequest{
+	payload := statObjectRequest{
 		Bucket: bucketName,
 		Path:   objectName,
 	}
 
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal stat request: %w", err)
+		c.logger.Printf("Failed to marshal stat request: %v", err)
+		return nil, ErrFailedToParseRequest
 	}
 
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return nil, err
+		c.logger.Printf("Failed to create request: %v", err)
+		return nil, ErrFailedToParseRequest
 	}
 
 	req.Header.Set("X-API-KEY", c.accessKey)
@@ -347,28 +430,24 @@ func (c *UploadClient) StatObject(bucketName, objectName string) (*ObjectInfo, e
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		c.logger.Printf("Failed to send request: %v", err)
+		return nil, ErrFailedToConnect
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("server returned status %d: %s", resp.StatusCode, string(body))
+	err = c.parseServerResponse(resp, &result)
+	if err != nil {
+		return nil, err
 	}
 
-	var info ObjectInfo
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-		return nil, fmt.Errorf("failed to decode stat response: %w", err)
-	}
-
-	return &info, nil
+	return &result, nil
 }
 
 // VerifyChecksum calls server verify endpoint
 func (c *UploadClient) verifyChecksum(bucketName, objectName, fileId, expectedChecksum string) error {
 	url := fmt.Sprintf("%s/upload/verify", c.endpoint)
 
-	payload := VerifyRequest{
+	payload := verifyRequest{
 		Bucket:   bucketName,
 		Path:     objectName,
 		FileId:   fileId,
@@ -377,12 +456,14 @@ func (c *UploadClient) verifyChecksum(bucketName, objectName, fileId, expectedCh
 
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("failed to marshal verify request: %w", err)
+		c.logger.Printf("Failed to marshal verify request: %v", err)
+		return ErrFailedToParseRequest
 	}
 
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return err
+		c.logger.Printf("Failed to create request: %v", err)
+		return ErrFailedToParseRequest
 	}
 
 	req.Header.Set("X-API-KEY", c.accessKey)
@@ -390,14 +471,10 @@ func (c *UploadClient) verifyChecksum(bucketName, objectName, fileId, expectedCh
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		c.logger.Printf("Failed to send request: %v", err)
+		return ErrFailedToConnect
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("verification failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	return nil
+	return c.parseServerResponse(resp, nil)
 }
