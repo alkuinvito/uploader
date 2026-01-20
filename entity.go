@@ -64,11 +64,12 @@ type statObjectRequest struct {
 }
 
 type UploadClientOptions struct {
-	AccessKey  string
-	ChunkSize  int
-	Endpoint   string
-	HTTPClient *http.Client
-	Logger     *log.Logger
+	AccessKey      string
+	ChunkSize      int
+	Endpoint       string
+	HTTPClient     *http.Client
+	Logger         *log.Logger
+	MaxConcurrency int
 }
 
 type UploadOptions struct {
@@ -79,6 +80,7 @@ type UploadOptions struct {
 type UploadResult struct {
 	Checksum string
 	Size     int64
+	Path     string
 }
 
 type verifyRequest struct {
@@ -86,4 +88,9 @@ type verifyRequest struct {
 	Path     string `json:"path"`
 	FileId   string `json:"file_id"`
 	Checksum string `json:"checksum"`
+}
+
+type chunkJob struct {
+	data     []byte
+	chunkNum int
 }

@@ -2,6 +2,7 @@ package uploader
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/base64"
@@ -10,18 +11,22 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
+	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
 
 type UploadClient struct {
-	accessKey  string
-	chunkSize  int
-	endpoint   string
-	httpClient *http.Client
-	logger     *log.Logger
+	accessKey      string
+	chunkSize      int
+	endpoint       string
+	httpClient     *http.Client
+	logger         *log.Logger
+	maxConcurrency int
 }
 
 type IUploadClient interface {
@@ -30,6 +35,7 @@ type IUploadClient interface {
 	GetObject(bucketName, objectName string) ([]byte, error)
 	ListObjects(bucketName, path string) ([]ObjectInfo, error)
 	PutObject(bucketName, objectName string, data []byte, opts *UploadOptions) (*UploadResult, error)
+	PutObjectForm(bucketName, objectName string, data []byte) (string, error)
 	StatObject(bucketName, objectName string) (*ObjectInfo, error)
 }
 
@@ -46,11 +52,12 @@ func NewClient(options *UploadClientOptions) *UploadClient {
 	}
 
 	return &UploadClient{
-		accessKey:  options.AccessKey,
-		chunkSize:  options.ChunkSize,
-		endpoint:   options.Endpoint,
-		httpClient: options.HTTPClient,
-		logger:     options.Logger,
+		accessKey:      options.AccessKey,
+		chunkSize:      options.ChunkSize,
+		endpoint:       options.Endpoint,
+		httpClient:     options.HTTPClient,
+		logger:         options.Logger,
+		maxConcurrency: options.MaxConcurrency,
 	}
 }
 
@@ -63,7 +70,8 @@ func NewClientWithDefaults(endpoint, accessKey string) *UploadClient {
 		HTTPClient: &http.Client{
 			Timeout: 30 * time.Second, // 30 seconds timeout
 		},
-		Logger: log.New(log.Writer(), "[UPLOADER] ", log.Flags()),
+		Logger:         log.New(log.Writer(), "[UPLOADER] ", log.Flags()),
+		MaxConcurrency: 5,
 	})
 }
 
@@ -302,10 +310,9 @@ func (c *UploadClient) parseServerResponse(resp *http.Response, out any) error {
 	return c.parseServerError(response.Error)
 }
 
-// PutObject uploads a file in chunks with checksum verification
+// PutObject uploads a file in chunks with checksum verification using concurrent workers
 func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opts *UploadOptions) (*UploadResult, error) {
 	totalSize := int64(len(data))
-	reader := bytes.NewReader(data)
 
 	checksumAlgo := Sha256Sum
 	if opts != nil && opts.ChecksumAlgorithm != "" {
@@ -314,44 +321,76 @@ func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opt
 
 	checksum, err := c.calculateChecksum(data, checksumAlgo)
 	if err != nil {
-		c.logger.Printf("Failed to calculate checksum: %v", err)
+		c.logger.Printf("PutObject: Failed to calculate checksum: %v", err)
 		return nil, err
 	}
 
 	fileId := uuid.New().String()
 
+	// Split data into chunks first
+	chunks := c.splitIntoChunks(data)
+	totalChunks := len(chunks)
+
+	// Configure concurrency
+	numWorkers := 5 // Adjust based on your needs
+	if c.maxConcurrency > 0 {
+		numWorkers = c.maxConcurrency
+	}
+
+	jobs := make(chan chunkJob, totalChunks)
+	results := make(chan error, totalChunks)
+
+	// Progress tracking
+	var uploadedMutex sync.Mutex
 	var uploaded int64
-	chunkNum := 0
 
-	for {
-		chunk := make([]byte, c.chunkSize)
-		n, err := reader.Read(chunk)
-		if err != nil && err != io.EOF {
-			c.logger.Printf("Failed to read chunk: %v", err)
-			return nil, ErrClientUploadFailed
+	// Start workers
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				err := c.sendChunk(bucketName, objectName, fileId, job.data, job.chunkNum, checksum)
+				results <- err
+
+				if err == nil {
+					// Update progress
+					uploadedMutex.Lock()
+					uploaded += int64(len(job.data))
+					currentUploaded := uploaded
+					uploadedMutex.Unlock()
+
+					if opts != nil && opts.OnProgress != nil {
+						opts.OnProgress(currentUploaded, totalSize)
+					}
+				}
+			}
+		}()
+	}
+
+	// Send jobs to workers
+	for i, chunk := range chunks {
+		jobs <- chunkJob{
+			data:     chunk,
+			chunkNum: i,
 		}
+	}
+	close(jobs)
 
-		if n == 0 {
-			break
-		}
+	// Wait for all workers to finish
+	wg.Wait()
+	close(results)
 
-		if err := c.sendChunk(bucketName, objectName, fileId, chunk[:n], chunkNum, checksum); err != nil {
-			c.logger.Printf("Failed to send chunk: %v", err)
+	// Check for errors
+	for err := range results {
+		if err != nil {
+			c.logger.Printf("PutObject: Failed to send chunk: %v", err)
 			return nil, err
-		}
-
-		uploaded += int64(n)
-		chunkNum++
-
-		if opts != nil && opts.OnProgress != nil {
-			opts.OnProgress(uploaded, totalSize)
-		}
-
-		if err == io.EOF {
-			break
 		}
 	}
 
+	// Verify checksum
 	if err := c.verifyChecksum(bucketName, objectName, fileId, checksum); err != nil {
 		return nil, ErrChecksumMismatch
 	}
@@ -360,6 +399,81 @@ func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opt
 		Checksum: checksum,
 		Size:     totalSize,
 	}, nil
+}
+
+// PutObjectForm uploads a file in one form request
+func (c *UploadClient) PutObjectForm(bucketName, objectName string, data []byte) (string, error) {
+	url := fmt.Sprintf("%s/upload/file", c.endpoint)
+
+	// Create a buffer to write multipart form
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	// Add text field: bucket
+	err := writer.WriteField("bucket", bucketName)
+	if err != nil {
+		c.logger.Printf("PutObjectForm: Failed to write bucket field: %v", err)
+		return "", ErrFailedToParseRequest
+	}
+
+	// Add text field: path
+	err = writer.WriteField("path", objectName)
+	if err != nil {
+		c.logger.Printf("PutObjectForm: Failed to write path field: %v", err)
+		return "", ErrFailedToParseRequest
+	}
+
+	// Add file field: data
+	part, err := writer.CreateFormFile("data", filepath.Base(objectName))
+	if err != nil {
+		c.logger.Printf("PutObjectForm: Failed to create form file: %v", err)
+		return "", ErrFailedToParseRequest
+	}
+
+	// Copy file data
+	_, err = io.Copy(part, bytes.NewReader(data))
+	if err != nil {
+		c.logger.Printf("PutObjectForm: Failed to copy file data: %v", err)
+		return "", ErrFailedToParseRequest
+	}
+
+	// Close the writer
+	err = writer.Close()
+	if err != nil {
+		c.logger.Printf("PutObjectForm: Failed to close writer: %v", err)
+		return "", ErrFailedToParseRequest
+	}
+
+	// Create HTTP request
+	req, err := http.NewRequestWithContext(context.Background(), "POST", url, body)
+	if err != nil {
+		c.logger.Printf("PutObjectForm: Failed to create request: %v", err)
+		return "", ErrFailedToParseRequest
+	}
+
+	// Set content type header
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	// Add authentication if available
+	req.Header.Set("X-API-KEY", c.accessKey)
+
+	// Send request
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		c.logger.Printf("PutObjectForm: Failed to send request: %v", err)
+		return "", ErrFailedToConnect
+	}
+	defer resp.Body.Close()
+
+	var resultPath string
+	err = c.parseServerResponse(resp, &resultPath)
+	if err != nil {
+		c.logger.Printf("PutObjectForm: Failed to parse response: %v", err)
+		return "", ErrParseResponseFailed
+	}
+
+	return resultPath, nil
 }
 
 // SendChunk sends single chunk to server
@@ -400,6 +514,20 @@ func (c *UploadClient) sendChunk(bucketName, objectName, fileId string, chunk []
 	defer resp.Body.Close()
 
 	return c.parseServerResponse(resp, nil)
+}
+
+// splitIntoChunks splits data into chunks of c.chunkSize
+func (c *UploadClient) splitIntoChunks(data []byte) [][]byte {
+	var chunks [][]byte
+	dataLen := len(data)
+
+	for i := 0; i < dataLen; i += int(c.chunkSize) {
+		end := i + int(c.chunkSize)
+		end = min(end, dataLen)
+		chunks = append(chunks, data[i:end])
+	}
+
+	return chunks
 }
 
 // StatObject returns information about an object in a bucket
