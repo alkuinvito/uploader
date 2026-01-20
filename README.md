@@ -38,7 +38,8 @@ func main() {
 }
 ```
 
-## Uploading (PutObject)
+## PutObject
+### Upload with chunked blob
 
 ```go
 import (
@@ -72,6 +73,39 @@ func main() {
     }
 
     fmt.Println("checksum:", res.Checksum, "size:", res.Size)
+}
+```
+
+## PutObjectForm
+### Upload with form file in single request
+
+```go
+import (
+    "fmt"
+    "log"
+    "os"
+
+    "github.com/alkuinvito/uploader"
+)
+
+func main() {
+    client := uploader.NewClientWithDefaults(
+        "https://uploads.yourcompany.com/api/v1",
+        "YOUR_API_KEY",
+    )
+
+    // Read file into bytes (example)
+    data, err := os.ReadFile("local-file.txt")
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    path, err := client.PutObjectForm("your_bucket", "path/to/file.txt", data)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Println("uploaded path", path)
 }
 ```
 
