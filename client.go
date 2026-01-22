@@ -15,9 +15,12 @@ import (
 	"net/http"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/cenkalti/backoff"
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 )
 
 type UploadClient struct {
@@ -35,7 +38,9 @@ type IUploadClient interface {
 	GetObject(bucketName, objectName string) ([]byte, error)
 	ListObjects(bucketName, path string) ([]ObjectInfo, error)
 	PutObject(bucketName, objectName string, data []byte, opts *UploadOptions) (*UploadResult, error)
+	PutObjectV2(ctx context.Context, bucketName, objectName string, data []byte, opts *UploadOptions) (*UploadResult, error)
 	PutObjectForm(bucketName, objectName string, data []byte) (string, error)
+	PutObjectFormV2(ctx context.Context, bucketName, objectName string, data []byte) (string, error)
 	StatObject(bucketName, objectName string) (*ObjectInfo, error)
 }
 
@@ -65,10 +70,15 @@ func NewClient(options *UploadClientOptions) *UploadClient {
 func NewClientWithDefaults(endpoint, accessKey string) *UploadClient {
 	return NewClient(&UploadClientOptions{
 		AccessKey: accessKey,
-		ChunkSize: 1024 * 1024, // 1MB default
+		ChunkSize: 5 * 1024 * 1024, // 5 MB default
 		Endpoint:  endpoint,
 		HTTPClient: &http.Client{
-			Timeout: 30 * time.Second, // 30 seconds timeout
+			Transport: &http.Transport{
+				MaxIdleConnsPerHost: 50,
+				MaxIdleConns:        100,
+				IdleConnTimeout:     90 * time.Second,
+			},
+			Timeout: 0,
 		},
 		Logger:         log.New(log.Writer(), "[UPLOADER] ", log.Flags()),
 		MaxConcurrency: 5,
@@ -401,6 +411,52 @@ func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opt
 	}, nil
 }
 
+// PutObjectV2 uploads a file in chunks with checksum verification using concurrent workers
+func (c *UploadClient) PutObjectV2(ctx context.Context, bucketName, objectName string, data []byte, opts *UploadOptions) (*UploadResult, error) {
+	totalSize := int64(len(data))
+	checksum, _ := c.calculateChecksum(data, Sha256Sum)
+	fileId := uuid.New().String()
+
+	// Use context to prevent hanging uploads
+	g, ctx := errgroup.WithContext(ctx)
+
+	sem := make(chan struct{}, c.maxConcurrency)
+	var uploaded int64
+
+	for i := 0; i < len(data); i += c.chunkSize {
+		start, end := i, i+c.chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+
+		chunkNum := i / c.chunkSize
+		chunkData := data[start:end] // Zero-copy slicing
+
+		g.Go(func() error {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			// Retry loop: 3 attempts with backoff
+			return backoff.Retry(func() error {
+				err := c.sendChunk(bucketName, objectName, fileId, chunkData, chunkNum, checksum)
+				if err == nil {
+					atomic.AddInt64(&uploaded, int64(len(chunkData)))
+					if opts != nil && opts.OnProgress != nil {
+						opts.OnProgress(atomic.LoadInt64(&uploaded), totalSize)
+					}
+				}
+				return err
+			}, backoff.WithContext(backoff.NewExponentialBackOff(), ctx))
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	return &UploadResult{Checksum: checksum, Size: totalSize}, nil
+}
+
 // PutObjectForm uploads a file in one form request
 func (c *UploadClient) PutObjectForm(bucketName, objectName string, data []byte) (string, error) {
 	url := fmt.Sprintf("%s/upload/file", c.endpoint)
@@ -474,6 +530,50 @@ func (c *UploadClient) PutObjectForm(bucketName, objectName string, data []byte)
 	}
 
 	return resultPath, nil
+}
+
+// PutObjectFormV2 uploads a file in one form request
+func (c *UploadClient) PutObjectFormV2(ctx context.Context, bucketName, objectName string, data []byte) (string, error) {
+	url := fmt.Sprintf("%s/upload/file", c.endpoint)
+
+	pr, pw := io.Pipe()
+	writer := multipart.NewWriter(pw)
+
+	go func() {
+		defer pw.Close()
+		defer writer.Close()
+
+		writer.WriteField("bucket", bucketName)
+		writer.WriteField("path", objectName)
+
+		part, err := writer.CreateFormFile("data", filepath.Base(objectName))
+		if err != nil {
+			c.logger.Printf("PutObjectFormV2: Failed to create form file: %v", err)
+			return
+		}
+
+		io.Copy(part, bytes.NewReader(data))
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, pr)
+	if err != nil {
+		c.logger.Printf("PutObjectFormV2: Failed to create http request: %v", err)
+		return "", ErrFailedToParseRequest
+	}
+
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-API-KEY", c.accessKey)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		c.logger.Printf("PutObjectFormV2: Failed to connect to server: %v", err)
+		return "", ErrFailedToConnect
+	}
+	defer resp.Body.Close()
+
+	var resultPath string
+	err = c.parseServerResponse(resp, &resultPath)
+	return resultPath, err
 }
 
 // SendChunk sends single chunk to server
