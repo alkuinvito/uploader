@@ -11,6 +11,13 @@ const (
 	Sha256Sum = "sha256"
 )
 
+type PresignedAction string
+
+const (
+	PresignedDownload PresignedAction = "GET"
+	PresignedUpload   PresignedAction = "PUT"
+)
+
 type chunkRequest struct {
 	BucketName string `json:"bucket_name"`
 	ObjectName string `json:"object_name"`
@@ -30,9 +37,12 @@ type downloadFileRequest struct {
 	Path   string `json:"path"`
 }
 
-type getObjectRequest struct {
-	Bucket string `json:"bucket"`
-	Path   string `json:"path"`
+type getPresignedObjectRequest struct {
+	Action       PresignedAction `json:"action"`
+	AllowedTypes []string        `json:"allowed_types"`
+	Bucket       string          `json:"bucket"`
+	ExpiresIn    int             `json:"expires_in"`
+	Path         string          `json:"path"`
 }
 
 type listObjectsRequest struct {
@@ -44,6 +54,11 @@ type ObjectInfo struct {
 	Name     string `json:"name"`
 	Size     int64  `json:"size"`
 	Modified string `json:"modified"`
+}
+
+type CreatePresignedUrlOptions struct {
+	AllowedTypes []string
+	ExpiresIn    int
 }
 
 type serverErrorBody struct {

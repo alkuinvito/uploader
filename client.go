@@ -14,6 +14,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -34,15 +35,22 @@ type UploadClient struct {
 }
 
 type IUploadClient interface {
+	calculateChecksum(data []byte, algorithm string) (string, error)
+	CreatePresignedUrl(bucketName, objectName string, action PresignedAction, options *CreatePresignedUrlOptions) (string, error)
 	DeleteObject(bucketName, objectName string) error
 	DownloadObject(bucketName, objectName string, w io.Writer) error
 	GetObject(bucketName, objectName string) ([]byte, error)
 	ListObjects(bucketName, path string) ([]ObjectInfo, error)
+	parseServerError(err *serverErrorBody) error
+	parseServerResponse(resp *http.Response, out any) error
 	PutObject(bucketName, objectName string, data []byte, opts *UploadOptions) (*UploadResult, error)
 	PutObjectV2(ctx context.Context, bucketName, objectName string, data []byte, opts *UploadOptions) (*UploadResult, error)
 	PutObjectForm(bucketName, objectName string, data []byte) (string, error)
 	PutObjectFormV2(ctx context.Context, bucketName, objectName string, data []byte) (string, error)
+	sendChunk(bucketName, objectName, fileId string, chunk []byte, chunkNum int, checksum string) error
+	splitIntoChunks(data []byte) [][]byte
 	StatObject(bucketName, objectName string) (*ObjectInfo, error)
+	verifyChecksum(bucketName, objectName, fileId, expectedChecksum string) error
 }
 
 // NewClient creates a new upload client
@@ -107,6 +115,65 @@ func (c *UploadClient) calculateChecksum(data []byte, algorithm string) (string,
 		c.logger.Printf("Unsupported algorithm: %s", algorithm)
 		return "", ErrUnsupportedAlgorithm
 	}
+}
+
+func (c *UploadClient) CreatePresignedUrl(bucketName, objectName string, action PresignedAction, options *CreatePresignedUrlOptions) (string, error) {
+	if options == nil {
+		options = &CreatePresignedUrlOptions{}
+	}
+
+	if options.ExpiresIn <= 0 {
+		options.ExpiresIn = 3600 // Default to 1 hour
+	}
+
+	apiUrl := fmt.Sprintf("%s/upload/presigned", c.endpoint)
+
+	reqBody := getPresignedObjectRequest{
+		Action:       action,
+		AllowedTypes: options.AllowedTypes,
+		Bucket:       bucketName,
+		ExpiresIn:    options.ExpiresIn,
+		Path:         objectName,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		c.logger.Printf("Failed to marshal request body: %v", err)
+		return "", ErrFailedToParseRequest
+	}
+
+	req, err := http.NewRequest("POST", apiUrl, bytes.NewBuffer(jsonData))
+	if err != nil {
+		c.logger.Printf("Failed to create request: %v", err)
+		return "", ErrFailedToParseRequest
+	}
+
+	req.Header.Set("X-API-KEY", c.accessKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		c.logger.Printf("Failed to send request: %v", err)
+		return "", ErrFailedToConnect
+	}
+	defer resp.Body.Close()
+
+	var presignedPath string
+	err = c.parseServerResponse(resp, &presignedPath)
+	if err != nil {
+		c.logger.Printf("Failed to parse response: %v", err)
+		return "", ErrParseResponseFailed
+	}
+
+	baseUrl, err := url.Parse(c.endpoint)
+	if err != nil {
+		c.logger.Printf("Failed to parse endpoint URL: %v", err)
+		return "", ErrParseResponseFailed
+	}
+
+	presignedUrl := fmt.Sprintf("%s://%s/presigned?token=%s", baseUrl.Scheme, baseUrl.Host, presignedPath)
+
+	return presignedUrl, nil
 }
 
 // DeleteObject calls DeleteFile handler on server
@@ -330,6 +397,8 @@ func (c *UploadClient) parseServerResponse(resp *http.Response, out any) error {
 }
 
 // PutObject uploads a file in chunks with checksum verification using concurrent workers
+//
+// @deprecated
 func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opts *UploadOptions) (*UploadResult, error) {
 	totalSize := int64(len(data))
 
@@ -467,6 +536,8 @@ func (c *UploadClient) PutObjectV2(ctx context.Context, bucketName, objectName s
 }
 
 // PutObjectForm uploads a file in one form request
+//
+// Deprecated: Use PutObjectFormV2 instead
 func (c *UploadClient) PutObjectForm(bucketName, objectName string, data []byte) (string, error) {
 	url := fmt.Sprintf("%s/upload/file", c.endpoint)
 
