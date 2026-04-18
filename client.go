@@ -364,6 +364,8 @@ func (c *UploadClient) parseServerError(err *serverErrorBody) error {
 		return ErrObjectFailedToOpen
 	case "ErrObjectInvalidDataURI":
 		return ErrObjectInvalidDataURI
+	case "ErrChecksumMismatch":
+		return ErrChecksumMismatch
 	}
 
 	return ErrUnknown
@@ -398,7 +400,7 @@ func (c *UploadClient) parseServerResponse(resp *http.Response, out any) error {
 
 // PutObject uploads a file in chunks with checksum verification using concurrent workers
 //
-// @deprecated
+// Deprecated: use PutObjectV2 instead
 func (c *UploadClient) PutObject(bucketName, objectName string, data []byte, opts *UploadOptions) (*UploadResult, error) {
 	totalSize := int64(len(data))
 
@@ -619,12 +621,15 @@ func (c *UploadClient) PutObjectFormV2(ctx context.Context, bucketName, objectNa
 	pr, pw := io.Pipe()
 	writer := multipart.NewWriter(pw)
 
+	checksum := fmt.Sprintf("%x", sha256.Sum256(data))
+
 	go func() {
 		defer pw.Close()
 		defer writer.Close()
 
 		writer.WriteField("bucket", bucketName)
 		writer.WriteField("path", objectName)
+		writer.WriteField("checksum", checksum)
 
 		part, err := writer.CreateFormFile("data", filepath.Base(objectName))
 		if err != nil {
@@ -651,9 +656,13 @@ func (c *UploadClient) PutObjectFormV2(ctx context.Context, bucketName, objectNa
 	}
 	defer resp.Body.Close()
 
-	var resultPath string
-	err = c.parseServerResponse(resp, &resultPath)
-	return resultPath, err
+	var result uploadFormV2Result
+	err = c.parseServerResponse(resp, &result)
+	if err != nil {
+		return "", err
+	}
+
+	return result.Filepath, err
 }
 
 // SendChunk sends single chunk to server
