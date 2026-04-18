@@ -109,3 +109,8 @@ type chunkJob struct {
 	data     []byte
 	chunkNum int
 }
+
+type uploadFormV2Result struct {
+	Filepath string `json:"filepath"`
+	Checksum string `json:"checksum"`
+}
